@@ -1,125 +1,92 @@
-"""API Serverless: diez reportes sísmicos recientes del IGP a DynamoDB."""
+"""Lambda: obtiene los 10 reportes sísmicos más recientes del IGP y los guarda en DynamoDB."""
 import json
 import os
-import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 import boto3
 import requests
-from bs4 import BeautifulSoup
 
-URL = 'https://ultimosismo.igp.gob.pe/productos/reportes-sismicos'
-TABLE_NAME = os.environ.get('TABLE_NAME', 'TablaWebScrapping')
-CODE_RE = re.compile(r'IGP\s*/\s*CENSIS\s*/\s*RS\s*\d{4}\s*-\s*\d+', re.I)
-DATE_RE = re.compile(r'\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}')
+BASE = "https://ultimosismo.igp.gob.pe/api/ultimo-sismo/ajaxb"
+TABLE_NAME = os.environ.get("TABLE_NAME", "TablaWebScrapping")
+FUENTE = "https://ultimosismo.igp.gob.pe/productos/reportes-sismicos"
 
 
-def limpiar(texto):
-    return ' '.join(texto.split()).strip()
-
-
-def extraer_sismos(html):
-    soup = BeautifulSoup(html, 'html.parser')
-    resultados = []
-    vistos = set()
-
-    # La vista publicada por el IGP incluye una tabla con estas columnas.
-    for tabla in soup.find_all('table'):
-        headers = [limpiar(h.get_text(' ', strip=True)).lower() for h in tabla.select('thead th')]
-        if not headers:
-            encabezado = tabla.find('tr')
-            if encabezado:
-                headers = [limpiar(h.get_text(' ', strip=True)).lower() for h in encabezado.find_all('th')]
-        for tr in tabla.find_all('tr'):
-            tds = tr.find_all('td')
-            if not tds:
-                continue
-            cells = [limpiar(td.get_text(' ', strip=True)) for td in tds]
-            codigo = next((CODE_RE.search(c).group(0) for c in cells if CODE_RE.search(c)), None)
-            if not codigo:
-                continue
-            fecha = next((DATE_RE.search(c).group(0) for c in cells if DATE_RE.search(c)), None)
-            # Según la tabla pública: posición, código, referencia, semáforo, magnitud, fecha.
-            cod_idx = next(i for i, c in enumerate(cells) if CODE_RE.search(c))
-            referencia = cells[cod_idx + 1] if len(cells) > cod_idx + 1 else ''
-            semaforo = cells[cod_idx + 2].lower() if len(cells) > cod_idx + 2 else ''
-            magnitud_texto = cells[cod_idx + 3] if len(cells) > cod_idx + 3 else ''
-            agregar(resultados, vistos, codigo, referencia, semaforo, magnitud_texto, fecha)
-
-    # Vista alternativa del sitio: tarjetas etiquetadas como "Fila #".
-    if len(resultados) < 10:
-        contenido = soup.get_text('\n', strip=True)
-        patron = re.compile(
-            r'Cod reporte:\s*(IGP\s*/\s*CENSIS\s*/\s*RS\s*\d{4}\s*-\s*\d+)'
-            r'\s*Referencia:\s*(.*?)\s*Semáforo:\s*(.*?)\s*Magnitud:\s*([\d.,]+)'
-            r'\s*Fecha y hora de origen local:\s*(' + DATE_RE.pattern + ')', re.I | re.S
-        )
-        for m in patron.finditer(contenido):
-            agregar(resultados, vistos, *m.groups())
-
-    # Orden cronológico para devolver exclusivamente los diez más recientes.
-    resultados.sort(key=lambda r: datetime.strptime(r['fecha_hora_local'], '%d/%m/%Y %H:%M:%S'), reverse=True)
-    return resultados[:10]
-
-
-def agregar(resultados, vistos, codigo, referencia, semaforo, magnitud_texto, fecha):
-    codigo = limpiar(codigo)
-    if not fecha or codigo in vistos:
-        return
-    try:
-        magnitud = str(float(magnitud_texto.replace(',', '.')))
-        datetime.strptime(fecha, '%d/%m/%Y %H:%M:%S')
-    except (ValueError, AttributeError):
-        return
-    vistos.add(codigo)
-    resultados.append({
-        'id': codigo,  # Clave primaria de DynamoDB; evita duplicados entre ejecuciones.
-        'codigo_reporte': codigo,
-        'referencia': limpiar(referencia),
-        'semaforo': limpiar(semaforo).lower(),
-        'magnitud': magnitud,
-        'fecha_hora_local': fecha,
-        'fuente': URL,
-    })
-
-
-def respuesta(status, contenido):
+def responder(status, datos):
     return {
-        'statusCode': status,
-        'headers': {'Content-Type': 'application/json; charset=utf-8'},
-        'body': json.dumps(contenido, ensure_ascii=False),
+        "statusCode": status,
+        "headers": {"Content-Type": "application/json; charset=utf-8"},
+        "body": json.dumps(datos, ensure_ascii=False, default=str),
     }
+
+
+def obtener_reportes():
+    anio = datetime.now(timezone.utc).year
+    registros = []
+    for year in (anio, anio - 1):
+        respuesta = requests.get(f"{BASE}/{year}", timeout=20,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+        respuesta.raise_for_status()
+        datos = respuesta.json()
+        if not isinstance(datos, list):
+            raise ValueError("La API del IGP no devolvió una lista JSON")
+        registros.extend(x for x in datos if isinstance(x, dict) and
+                         x.get("codigo") and str(x.get("publicado", "1")) == "1")
+        if len(registros) >= 10:
+            break
+
+    # El endpoint devuelve los sismos del año en orden ascendente.
+    # Numero_reporte y año permiten obtener los últimos, sin depender del orden JSON.
+    registros.sort(key=lambda s: (
+        int(str(s["codigo"]).split("-")[0]),
+        int(s.get("numero_reporte") or str(s["codigo"]).split("-")[-1])
+    ), reverse=True)
+    vistos = set()
+    ultimos = []
+    for s in registros:
+        if s["codigo"] not in vistos:
+            vistos.add(s["codigo"])
+            ultimos.append({
+                "id": str(s["codigo"]),
+                "codigo": str(s["codigo"]),
+                "fecha_local": s.get("fecha_local"),
+                "hora_local": s.get("hora_local"),
+                "magnitud": str(s.get("magnitud", "")),
+                "profundidad": s.get("profundidad"),
+                "latitud": str(s.get("latitud", "")),
+                "longitud": str(s.get("longitud", "")),
+                "referencia": s.get("referencia"),
+                "intensidad": s.get("intensidad"),
+                "fuente": FUENTE,
+            })
+        if len(ultimos) == 10:
+            break
+    return ultimos
 
 
 def lambda_handler(event, context):
     try:
-        r = requests.get(URL, headers={'User-Agent': 'Mozilla/5.0 (compatible; TallerScraping/1.0)'}, timeout=20)
-        r.raise_for_status()
-        sismos = extraer_sismos(r.text)
+        sismos = obtener_reportes()
         if len(sismos) != 10:
-            return respuesta(502, {
-                'error': 'No se pudieron extraer diez reportes de la página pública del IGP.',
-                'encontrados': len(sismos),
-                'detalle': 'Revisar el HTML/selector; la página podría cargar datos mediante JavaScript.',
-            })
+            return responder(502, {"error": "No se obtuvieron 10 reportes", "encontrados": len(sismos)})
 
-        table = boto3.resource('dynamodb').Table(TABLE_NAME)
-        # Reemplaza los elementos de la tabla, como en el ejemplo del taller.
-        # DynamoDB Scan necesita paginación para limpiar completamente.
-        scan_kwargs = {'ProjectionExpression': 'id'}
-        with table.batch_writer() as batch:
-            while True:
-                page = table.scan(**scan_kwargs)
-                for item in page.get('Items', []):
-                    batch.delete_item(Key={'id': item['id']})
-                if 'LastEvaluatedKey' not in page:
-                    break
-                scan_kwargs['ExclusiveStartKey'] = page['LastEvaluatedKey']
+        tabla = boto3.resource("dynamodb").Table(TABLE_NAME)
+        # Elimina elementos anteriores para que la tabla represente solo los 10 últimos.
+        keys = []
+        parametros = {"ProjectionExpression": "id"}
+        while True:
+            pagina = tabla.scan(**parametros)
+            keys.extend(item["id"] for item in pagina.get("Items", []))
+            if "LastEvaluatedKey" not in pagina:
+                break
+            parametros["ExclusiveStartKey"] = pagina["LastEvaluatedKey"]
+        with tabla.batch_writer() as batch:
+            for clave in keys:
+                batch.delete_item(Key={"id": clave})
             for sismo in sismos:
+                # DynamoDB no acepta valores float, y los valores faltantes pueden ser null.
                 batch.put_item(Item=sismo)
-        return respuesta(200, {'total': len(sismos), 'sismos': sismos})
-    except requests.RequestException as exc:
-        return respuesta(502, {'error': 'No se pudo consultar IGP', 'detalle': str(exc)})
+
+        return responder(200, {"total": len(sismos), "sismos": sismos})
     except Exception as exc:
-        print('Error en scraping/DynamoDB:', repr(exc))
-        return respuesta(500, {'error': 'Error interno al guardar los reportes'})
+        print("Error al consultar IGP o escribir en DynamoDB:", repr(exc))
+        return responder(500, {"error": str(exc)})
