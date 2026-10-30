@@ -1,0 +1,41 @@
+# Cambia org y role por los valores de tu cuenta/laboratorio antes de desplegar.
+# org: TU_ORG_SERVERLESS  # Descomenta si tu cuenta Serverless requiere org.
+service: api-web-scraping
+
+provider:
+  name: aws
+  runtime: python3.12
+  region: us-east-1
+  memorySize: 256
+  timeout: 30
+  # En AWS Academy, descomenta y coloca el ARN real de LabRole:
+  # iam:
+  #   role: arn:aws:iam::TU_ACCOUNT_ID:role/LabRole
+  environment:
+    TABLE_NAME: TablaWebScrapping
+
+functions:
+  scrape_table:
+    handler: scrap_table.lambda_handler
+    package:
+      patterns:
+        - '**'
+    events:
+      - http:
+          path: scrape/table
+          method: get
+          cors: true
+
+resources:
+  Resources:
+    TablaWebScrapping:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: TablaWebScrapping
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
